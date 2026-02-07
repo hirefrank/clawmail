@@ -6,4 +6,5 @@ export interface Env {
   RESEND_API_KEY: string;
   FROM_EMAIL: string;
   FROM_NAME: string;
+  REPLY_TO_EMAIL: string;
 }

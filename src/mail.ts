@@ -85,7 +85,7 @@ export async function sendEmail(
       : undefined,
     subject: params.subject,
     text: params.body,
-    replyTo: params.replyTo,
+    replyTo: params.replyTo ?? env.REPLY_TO_EMAIL,
     headers: Object.keys(headers).length > 0 ? headers : undefined,
     attachments: resendAttachments.length > 0 ? resendAttachments : undefined,
   });
@@ -203,6 +203,7 @@ export async function replyToMessage(
   const { data, error } = await resend.emails.send({
     from: `${env.FROM_NAME} <${env.FROM_EMAIL}>`,
     to: [replyTo],
+    replyTo: env.REPLY_TO_EMAIL,
     subject,
     text: body,
     headers:

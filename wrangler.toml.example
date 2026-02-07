@@ -32,8 +32,9 @@ new_sqlite_classes = ["EmailMCP"]
 
 # --- Environment Variables ---
 [vars]
-FROM_EMAIL = "mail@yourdomain.com"
+FROM_EMAIL = "noreply@yourdomain.com"
 FROM_NAME = "Clawmail"
+REPLY_TO_EMAIL = "reply@yourdomain.com"
 
 # --- Secrets ---
 # Set these with:
