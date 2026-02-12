@@ -1,11 +1,13 @@
 import PostalMime from "postal-mime";
 import { sql } from "kysely";
 import { getDb } from "./db/client";
+import { dispatchWebhook } from "./webhooks";
 import type { Env } from "./types";
 
 export async function handleInboundEmail(
   message: ForwardableEmailMessage,
-  env: Env
+  env: Env,
+  ctx: ExecutionContext
 ) {
   const raw = new Response(message.raw);
   const arrayBuffer = await raw.arrayBuffer();
@@ -101,12 +103,15 @@ export async function handleInboundEmail(
       from,
       to,
       cc,
+      bcc: null,
       subject,
       body_text: parsed.text ?? null,
       body_html: parsed.html ?? null,
       headers: headersJson,
       direction: "inbound",
       approved,
+      status: null,
+      archived: 0,
       created_at: now,
     })
     .execute();
@@ -133,5 +138,21 @@ export async function handleInboundEmail(
         })
         .execute();
     }
+  }
+
+  // Dispatch webhook for inbound message
+  if (env.WEBHOOK_URL) {
+    ctx.waitUntil(
+      dispatchWebhook(env.WEBHOOK_URL, env.WEBHOOK_SECRET, "message.received", {
+        id: msgId,
+        thread_id: threadId,
+        from,
+        to,
+        subject,
+        direction: "inbound",
+        approved,
+        created_at: now,
+      })
+    );
   }
 }

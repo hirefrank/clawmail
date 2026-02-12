@@ -17,16 +17,19 @@ Cloudflare Worker with two entry points: `fetch` (HTTP) and `email` (inbound ema
 
 **Request routing in `src/index.ts`:**
 - `/mcp` → Bearer token auth → `EmailMCP.serve()` (Durable Object)
-- Everything else → Hono app (`src/api.ts`) which handles `/api/*` with `X-API-Key` auth
+- Everything else → Hono app (`src/api.ts`) which handles `/api/*` with `X-API-Key` auth and `/webhooks/*` unauthenticated
 
 **Data flow:**
-- Inbound email (`src/email.ts`): `postal-mime` parses raw email → checks `approved_senders` table → stores in D1 with `approved=1` if sender is known, `approved=0` otherwise → attachments to R2
-- Outbound email (`src/mail.ts`): Resend SDK sends → stores sent message in D1 with `approved=1` (always), attachments in R2
-- Both API routes and MCP tools call the same `sendEmail()`/`replyToMessage()` functions from `src/mail.ts`
+- Inbound email (`src/email.ts`): `postal-mime` parses raw email → checks `approved_senders` table → stores in D1 with `approved=1` if sender is known, `approved=0` otherwise → attachments to R2 → dispatches `message.received` webhook if `WEBHOOK_URL` is set
+- Outbound email (`src/mail.ts`): Resend SDK sends → stores sent message in D1 with `approved=1` (always) and `status='sent'`, attachments in R2
+- Delivery tracking: Resend sends status webhooks to `POST /webhooks/resend` → updates `messages.status` in D1
+- Both API routes and MCP tools call shared service functions: `src/mail.ts` (send/reply), `src/labels.ts` (add/remove), `src/archive.ts` (archive/unarchive), `src/search.ts` (FTS5 search), `src/drafts.ts` (draft CRUD + send)
 
 **MCP server (`src/mcp.ts`):** `McpAgent` Durable Object (from `agents/mcp`) with `McpServer` (from `@modelcontextprotocol/sdk`). Tools registered in `init()` using `this.server.registerTool()` with Zod schemas.
 
 **Database:** Kysely over D1 via `kysely-d1`. Schema types in `src/db/schema.ts`, factory in `src/db/client.ts`. Use `sql` template tag from Kysely for raw expressions (e.g., `sql\`message_count + 1\``), not `db.raw()`.
+
+**Full-text search:** `messages_fts` FTS5 virtual table synced via SQLite triggers (insert/update/delete). Search endpoints try FTS5 MATCH first and fall back to LIKE on invalid query syntax.
 
 ## Key Patterns
 
@@ -38,3 +41,8 @@ Cloudflare Worker with two entry points: `fetch` (HTTP) and `email` (inbound ema
 - All timestamps are Unix milliseconds (`Date.now()`)
 - `wrangler.toml` is gitignored; `wrangler.toml.example` is the committed template
 - **Sender approval (anti-injection):** All query routes/tools filter `approved=1` by default. `list_pending` returns metadata only (no body/html) to prevent prompt injection during review. `approve_sender` allowlists + retroactively approves. Sender emails are normalized to lowercase everywhere.
+- **Labels:** Stored in `message_labels` junction table (composite PK: message_id + label). Use `onConflict(...).doNothing()` when adding labels to handle duplicates.
+- **Archival:** `archived` column on messages (default 0). All list/search queries exclude archived messages unless `include_archived` is explicitly set.
+- **Drafts:** Separate `drafts` table with full CRUD. `send_draft` converts to a real email via `sendEmail()` (with threading headers if `thread_id` is set) and deletes the draft.
+- **Delivery status:** `status` column on messages (`null` for inbound, `sent`/`delivered`/`bounced`/`complained` for outbound). Updated via Resend webhook at `/webhooks/resend`.
+- **Webhooks:** `src/webhooks.ts` dispatches HMAC-signed POSTs. Called from `email.ts` via `ctx.waitUntil()` to avoid blocking the email handler.

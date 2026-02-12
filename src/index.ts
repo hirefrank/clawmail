@@ -51,6 +51,6 @@ export default {
   },
 
   async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
-    await handleInboundEmail(message, env);
+    await handleInboundEmail(message, env, ctx);
   },
 };
