@@ -1,9 +1,18 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { sql } from "kysely";
 import { getDb } from "./db/client";
 import { sendEmail, replyToMessage } from "./mail";
+import { addLabels, removeLabel } from "./labels";
+import { archiveMessage, unarchiveMessage } from "./archive";
+import { searchMessages } from "./search";
+import {
+  createDraft,
+  updateDraft,
+  listDrafts,
+  sendDraft,
+  deleteDraft,
+} from "./drafts";
 import type { Env } from "./types";
 
 export class EmailMCP extends McpAgent<Env, {}, {}> {
@@ -267,39 +276,7 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ query, limit, include_archived }) => {
         const db = getDb(this.env.DB);
-        const maxResults = limit ?? 20;
-
-        let messages;
-        try {
-          const archivedFilter = include_archived ? sql`1=1` : sql`m.archived = 0`;
-          const results = await sql`
-            SELECT m.* FROM messages m
-            JOIN messages_fts f ON f.message_id = m.id
-            WHERE messages_fts MATCH ${query}
-            AND m.approved = 1
-            AND ${archivedFilter}
-            ORDER BY rank
-            LIMIT ${maxResults}
-          `.execute(db);
-          messages = results.rows;
-        } catch {
-          // Fallback to LIKE search
-          let q = db
-            .selectFrom("messages")
-            .selectAll()
-            .where("approved", "=", 1)
-            .where((eb) =>
-              eb.or([
-                eb("subject", "like", `%${query}%`),
-                eb("body_text", "like", `%${query}%`),
-              ])
-            )
-            .orderBy("created_at", "desc")
-            .limit(maxResults);
-
-          if (!include_archived) q = q.where("archived", "=", 0);
-          messages = await q.execute();
-        }
+        const messages = await searchMessages(db, query, limit ?? 20, include_archived ?? false);
 
         return {
           content: [
@@ -361,40 +338,20 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ id, labels }) => {
         const db = getDb(this.env.DB);
+        const result = await addLabels(db, id, labels);
 
-        const msg = await db
-          .selectFrom("messages")
-          .select("approved")
-          .where("id", "=", id)
-          .executeTakeFirst();
-
-        if (!msg || msg.approved !== 1) {
+        if (!result) {
           return {
             content: [{ type: "text" as const, text: "Message not found" }],
             isError: true,
           };
         }
 
-        const now = Date.now();
-        for (const label of labels) {
-          await db
-            .insertInto("message_labels")
-            .values({ message_id: id, label, created_at: now })
-            .onConflict((oc) => oc.columns(["message_id", "label"]).doNothing())
-            .execute();
-        }
-
-        const allLabels = await db
-          .selectFrom("message_labels")
-          .select("label")
-          .where("message_id", "=", id)
-          .execute();
-
         return {
           content: [
             {
               type: "text" as const,
-              text: `Labels updated. Current labels: ${allLabels.map((l) => l.label).join(", ")}`,
+              text: `Labels updated. Current labels: ${result.labels.join(", ")}`,
             },
           ],
         };
@@ -404,7 +361,7 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
     this.server.registerTool(
       "remove_label",
       {
-        description: "Remove a label from a message",
+        description: "Remove a label from an approved message",
         inputSchema: {
           id: z.string().describe("Message ID"),
           label: z.string().describe("Label to remove"),
@@ -412,18 +369,20 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ id, label }) => {
         const db = getDb(this.env.DB);
+        const result = await removeLabel(db, id, label);
 
-        await db
-          .deleteFrom("message_labels")
-          .where("message_id", "=", id)
-          .where("label", "=", label)
-          .execute();
+        if (!result) {
+          return {
+            content: [{ type: "text" as const, text: "Message not found" }],
+            isError: true,
+          };
+        }
 
         return {
           content: [
             {
               type: "text" as const,
-              text: `Removed label: ${label}`,
+              text: `Removed label: ${result.removed}`,
             },
           ],
         };
@@ -442,12 +401,14 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ id }) => {
         const db = getDb(this.env.DB);
+        const found = await archiveMessage(db, id);
 
-        await db
-          .updateTable("messages")
-          .set({ archived: 1 })
-          .where("id", "=", id)
-          .execute();
+        if (!found) {
+          return {
+            content: [{ type: "text" as const, text: "Message not found" }],
+            isError: true,
+          };
+        }
 
         return {
           content: [
@@ -470,12 +431,14 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ id }) => {
         const db = getDb(this.env.DB);
+        const found = await unarchiveMessage(db, id);
 
-        await db
-          .updateTable("messages")
-          .set({ archived: 0 })
-          .where("id", "=", id)
-          .execute();
+        if (!found) {
+          return {
+            content: [{ type: "text" as const, text: "Message not found" }],
+            isError: true,
+          };
+        }
 
         return {
           content: [
@@ -503,31 +466,15 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
           thread_id: z.string().optional().describe("Thread ID to associate with"),
         },
       },
-      async ({ to, cc, bcc, subject, body_text, thread_id }) => {
+      async (params) => {
         const db = getDb(this.env.DB);
-        const now = Date.now();
-        const id = crypto.randomUUID();
-
-        await db
-          .insertInto("drafts")
-          .values({
-            id,
-            thread_id: thread_id ?? null,
-            to: to ?? null,
-            cc: cc ?? null,
-            bcc: bcc ?? null,
-            subject: subject ?? "",
-            body_text: body_text ?? "",
-            created_at: now,
-            updated_at: now,
-          })
-          .execute();
+        const result = await createDraft(db, params);
 
         return {
           content: [
             {
               type: "text" as const,
-              text: `Draft created.\nID: ${id}`,
+              text: `Draft created.\nID: ${result.id}`,
             },
           ],
         };
@@ -545,36 +492,19 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
           bcc: z.string().optional().describe("BCC recipients"),
           subject: z.string().optional().describe("Email subject"),
           body_text: z.string().optional().describe("Email body (plain text)"),
+          thread_id: z.string().optional().describe("Thread ID to associate with"),
         },
       },
-      async ({ id, to, cc, bcc, subject, body_text }) => {
+      async ({ id, ...params }) => {
         const db = getDb(this.env.DB);
+        const found = await updateDraft(db, id, params);
 
-        const existing = await db
-          .selectFrom("drafts")
-          .select("id")
-          .where("id", "=", id)
-          .executeTakeFirst();
-
-        if (!existing) {
+        if (!found) {
           return {
             content: [{ type: "text" as const, text: "Draft not found" }],
             isError: true,
           };
         }
-
-        const updates: Record<string, unknown> = { updated_at: Date.now() };
-        if (to !== undefined) updates.to = to;
-        if (cc !== undefined) updates.cc = cc;
-        if (bcc !== undefined) updates.bcc = bcc;
-        if (subject !== undefined) updates.subject = subject;
-        if (body_text !== undefined) updates.body_text = body_text;
-
-        await db
-          .updateTable("drafts")
-          .set(updates)
-          .where("id", "=", id)
-          .execute();
 
         return {
           content: [
@@ -598,13 +528,7 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ limit, offset }) => {
         const db = getDb(this.env.DB);
-        const drafts = await db
-          .selectFrom("drafts")
-          .selectAll()
-          .orderBy("updated_at", "desc")
-          .limit(limit ?? 50)
-          .offset(offset ?? 0)
-          .execute();
+        const drafts = await listDrafts(db, limit ?? 50, offset ?? 0);
 
         return {
           content: [
@@ -627,36 +551,14 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ id }) => {
         const db = getDb(this.env.DB);
+        const result = await sendDraft(this.env, db, id);
 
-        const draft = await db
-          .selectFrom("drafts")
-          .selectAll()
-          .where("id", "=", id)
-          .executeTakeFirst();
-
-        if (!draft) {
+        if ("error" in result) {
           return {
-            content: [{ type: "text" as const, text: "Draft not found" }],
+            content: [{ type: "text" as const, text: result.error }],
             isError: true,
           };
         }
-
-        if (!draft.to) {
-          return {
-            content: [{ type: "text" as const, text: "Draft has no recipient" }],
-            isError: true,
-          };
-        }
-
-        const result = await sendEmail(this.env, db, {
-          to: draft.to,
-          subject: draft.subject,
-          body: draft.body_text,
-          cc: draft.cc ?? undefined,
-          bcc: draft.bcc ?? undefined,
-        });
-
-        await db.deleteFrom("drafts").where("id", "=", id).execute();
 
         return {
           content: [
@@ -679,7 +581,14 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       },
       async ({ id }) => {
         const db = getDb(this.env.DB);
-        await db.deleteFrom("drafts").where("id", "=", id).execute();
+        const found = await deleteDraft(db, id);
+
+        if (!found) {
+          return {
+            content: [{ type: "text" as const, text: "Draft not found" }],
+            isError: true,
+          };
+        }
 
         return {
           content: [

@@ -1,7 +1,17 @@
 import { Hono } from "hono";
-import { sql } from "kysely";
 import { getDb } from "./db/client";
 import { sendEmail, replyToMessage } from "./mail";
+import { addLabels, removeLabel } from "./labels";
+import { archiveMessage, unarchiveMessage } from "./archive";
+import { searchMessages } from "./search";
+import {
+  createDraft,
+  getDraft,
+  updateDraft,
+  listDrafts,
+  sendDraft,
+  deleteDraft,
+} from "./drafts";
 import type { Env } from "./types";
 
 const api = new Hono<{ Bindings: Env }>();
@@ -24,7 +34,7 @@ api.use("/api/*", async (c, next) => {
   await next();
 });
 
-// --- Resend Delivery Webhook (unauthenticated, outside /api/*) ---
+// --- Resend Delivery Webhook (token-verified, outside /api/*) ---
 
 const RESEND_STATUS_MAP: Record<string, string> = {
   "email.sent": "sent",
@@ -36,7 +46,15 @@ const RESEND_STATUS_MAP: Record<string, string> = {
 api.post("/webhooks/resend", async (c) => {
   if (c.env.RESEND_WEBHOOK_SECRET) {
     const token = c.req.query("token");
-    if (token !== c.env.RESEND_WEBHOOK_SECRET) {
+    if (!token) return c.json({ error: "Missing token" }, 401);
+
+    const expected = new TextEncoder().encode(c.env.RESEND_WEBHOOK_SECRET);
+    const provided = new TextEncoder().encode(token);
+
+    if (
+      expected.byteLength !== provided.byteLength ||
+      !crypto.subtle.timingSafeEqual(expected, provided)
+    ) {
       return c.json({ error: "Invalid token" }, 401);
     }
   }
@@ -202,45 +220,15 @@ api.get("/api/attachments/:id", async (c) => {
 
 // Search messages (FTS5 with LIKE fallback)
 api.get("/api/search", async (c) => {
-  const db = getDb(c.env.DB);
   const q = c.req.query("q");
   const limit = Number(c.req.query("limit") ?? 20);
   const includeArchived = c.req.query("include_archived") === "true";
 
   if (!q) return c.json({ error: "Missing query parameter 'q'" }, 400);
 
-  try {
-    const archivedFilter = includeArchived ? sql`1=1` : sql`m.archived = 0`;
-    const results = await sql`
-      SELECT m.* FROM messages m
-      JOIN messages_fts f ON f.message_id = m.id
-      WHERE messages_fts MATCH ${q}
-      AND m.approved = 1
-      AND ${archivedFilter}
-      ORDER BY rank
-      LIMIT ${limit}
-    `.execute(db);
-    return c.json(results.rows);
-  } catch {
-    // Fallback to LIKE search if FTS query syntax is invalid
-    let query = db
-      .selectFrom("messages")
-      .selectAll()
-      .where("approved", "=", 1)
-      .where((eb) =>
-        eb.or([
-          eb("subject", "like", `%${q}%`),
-          eb("body_text", "like", `%${q}%`),
-        ])
-      )
-      .orderBy("created_at", "desc")
-      .limit(limit);
-
-    if (!includeArchived) query = query.where("archived", "=", 0);
-
-    const messages = await query.execute();
-    return c.json(messages);
-  }
+  const db = getDb(c.env.DB);
+  const messages = await searchMessages(db, q, limit, includeArchived);
+  return c.json(messages);
 });
 
 // --- Threads ---
@@ -295,51 +283,24 @@ api.get("/api/threads/:id", async (c) => {
 
 // --- Labels ---
 
-// Add labels to a message
 api.post("/api/messages/:id/labels", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
   const { labels } = await c.req.json<{ labels: string[] }>();
 
-  const msg = await db
-    .selectFrom("messages")
-    .select("approved")
-    .where("id", "=", id)
-    .executeTakeFirst();
-
-  if (!msg || msg.approved !== 1) return c.json({ error: "Not found" }, 404);
-
-  const now = Date.now();
-  for (const label of labels) {
-    await db
-      .insertInto("message_labels")
-      .values({ message_id: id, label, created_at: now })
-      .onConflict((oc) => oc.columns(["message_id", "label"]).doNothing())
-      .execute();
-  }
-
-  const allLabels = await db
-    .selectFrom("message_labels")
-    .select("label")
-    .where("message_id", "=", id)
-    .execute();
-
-  return c.json({ labels: allLabels.map((l) => l.label) });
+  const result = await addLabels(db, id, labels);
+  if (!result) return c.json({ error: "Not found" }, 404);
+  return c.json(result);
 });
 
-// Remove a label from a message
 api.delete("/api/messages/:id/labels/:label", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
   const label = decodeURIComponent(c.req.param("label"));
 
-  await db
-    .deleteFrom("message_labels")
-    .where("message_id", "=", id)
-    .where("label", "=", label)
-    .execute();
-
-  return c.json({ removed: label });
+  const result = await removeLabel(db, id, label);
+  if (!result) return c.json({ error: "Not found" }, 404);
+  return c.json(result);
 });
 
 // --- Archive / Unarchive ---
@@ -348,12 +309,8 @@ api.post("/api/messages/:id/archive", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
 
-  await db
-    .updateTable("messages")
-    .set({ archived: 1 })
-    .where("id", "=", id)
-    .execute();
-
+  const found = await archiveMessage(db, id);
+  if (!found) return c.json({ error: "Not found" }, 404);
   return c.json({ archived: true });
 });
 
@@ -361,35 +318,21 @@ api.post("/api/messages/:id/unarchive", async (c) => {
   const db = getDb(c.env.DB);
   const id = c.req.param("id");
 
-  await db
-    .updateTable("messages")
-    .set({ archived: 0 })
-    .where("id", "=", id)
-    .execute();
-
+  const found = await unarchiveMessage(db, id);
+  if (!found) return c.json({ error: "Not found" }, 404);
   return c.json({ archived: false });
 });
 
 // --- Drafts ---
 
-// List drafts
 api.get("/api/drafts", async (c) => {
   const db = getDb(c.env.DB);
   const limit = Number(c.req.query("limit") ?? 50);
   const offset = Number(c.req.query("offset") ?? 0);
-
-  const drafts = await db
-    .selectFrom("drafts")
-    .selectAll()
-    .orderBy("updated_at", "desc")
-    .limit(limit)
-    .offset(offset)
-    .execute();
-
+  const drafts = await listDrafts(db, limit, offset);
   return c.json(drafts);
 });
 
-// Create draft
 api.post("/api/drafts", async (c) => {
   const body = await c.req.json<{
     to?: string;
@@ -399,45 +342,18 @@ api.post("/api/drafts", async (c) => {
     body_text?: string;
     thread_id?: string;
   }>();
-
   const db = getDb(c.env.DB);
-  const now = Date.now();
-  const id = crypto.randomUUID();
-
-  await db
-    .insertInto("drafts")
-    .values({
-      id,
-      thread_id: body.thread_id ?? null,
-      to: body.to ?? null,
-      cc: body.cc ?? null,
-      bcc: body.bcc ?? null,
-      subject: body.subject ?? "",
-      body_text: body.body_text ?? "",
-      created_at: now,
-      updated_at: now,
-    })
-    .execute();
-
-  return c.json({ id }, 201);
+  const result = await createDraft(db, body);
+  return c.json(result, 201);
 });
 
-// Get draft
 api.get("/api/drafts/:id", async (c) => {
   const db = getDb(c.env.DB);
-  const id = c.req.param("id");
-
-  const draft = await db
-    .selectFrom("drafts")
-    .selectAll()
-    .where("id", "=", id)
-    .executeTakeFirst();
-
+  const draft = await getDraft(db, c.req.param("id"));
   if (!draft) return c.json({ error: "Not found" }, 404);
   return c.json(draft);
 });
 
-// Update draft
 api.put("/api/drafts/:id", async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json<{
@@ -448,68 +364,27 @@ api.put("/api/drafts/:id", async (c) => {
     body_text?: string;
     thread_id?: string;
   }>();
-
   const db = getDb(c.env.DB);
-
-  const existing = await db
-    .selectFrom("drafts")
-    .select("id")
-    .where("id", "=", id)
-    .executeTakeFirst();
-
-  if (!existing) return c.json({ error: "Not found" }, 404);
-
-  const updates: Record<string, unknown> = { updated_at: Date.now() };
-  if (body.to !== undefined) updates.to = body.to;
-  if (body.cc !== undefined) updates.cc = body.cc;
-  if (body.bcc !== undefined) updates.bcc = body.bcc;
-  if (body.subject !== undefined) updates.subject = body.subject;
-  if (body.body_text !== undefined) updates.body_text = body.body_text;
-  if (body.thread_id !== undefined) updates.thread_id = body.thread_id;
-
-  await db
-    .updateTable("drafts")
-    .set(updates)
-    .where("id", "=", id)
-    .execute();
-
+  const found = await updateDraft(db, id, body);
+  if (!found) return c.json({ error: "Not found" }, 404);
   return c.json({ id });
 });
 
-// Send draft (converts to real email, deletes draft)
 api.post("/api/drafts/:id/send", async (c) => {
   const db = getDb(c.env.DB);
-  const id = c.req.param("id");
-
-  const draft = await db
-    .selectFrom("drafts")
-    .selectAll()
-    .where("id", "=", id)
-    .executeTakeFirst();
-
-  if (!draft) return c.json({ error: "Not found" }, 404);
-  if (!draft.to) return c.json({ error: "Draft has no recipient" }, 400);
-
-  const result = await sendEmail(c.env, db, {
-    to: draft.to,
-    subject: draft.subject,
-    body: draft.body_text,
-    cc: draft.cc ?? undefined,
-    bcc: draft.bcc ?? undefined,
-  });
-
-  await db.deleteFrom("drafts").where("id", "=", id).execute();
-
+  const result = await sendDraft(c.env, db, c.req.param("id"));
+  if ("error" in result) {
+    const status = result.error === "Draft not found" ? 404 : 400;
+    return c.json(result, status);
+  }
   return c.json(result);
 });
 
-// Delete draft
 api.delete("/api/drafts/:id", async (c) => {
   const db = getDb(c.env.DB);
-  const id = c.req.param("id");
-
-  await db.deleteFrom("drafts").where("id", "=", id).execute();
-  return c.json({ deleted: id });
+  const found = await deleteDraft(db, c.req.param("id"));
+  if (!found) return c.json({ error: "Not found" }, 404);
+  return c.json({ deleted: c.req.param("id") });
 });
 
 // --- Sender Approval ---

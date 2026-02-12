@@ -20,6 +20,8 @@ interface SendEmailParams {
   replyTo?: string;
   inReplyTo?: string;
   references?: string;
+  /** Join an existing thread instead of creating a new one */
+  threadId?: string;
   attachments?: AttachmentInput[];
 }
 
@@ -98,18 +100,29 @@ export async function sendEmail(
 
   if (error) throw new Error(error.message);
 
-  // Create thread for outbound
-  const threadId = crypto.randomUUID();
-  await db
-    .insertInto("threads")
-    .values({
-      id: threadId,
-      subject: params.subject,
-      last_message_at: now,
-      message_count: 1,
-      created_at: now,
-    })
-    .execute();
+  // Create or join thread
+  const threadId = params.threadId ?? crypto.randomUUID();
+  if (params.threadId) {
+    await db
+      .updateTable("threads")
+      .set({
+        last_message_at: now,
+        message_count: sql`message_count + 1` as any,
+      })
+      .where("id", "=", params.threadId)
+      .execute();
+  } else {
+    await db
+      .insertInto("threads")
+      .values({
+        id: threadId,
+        subject: params.subject,
+        last_message_at: now,
+        message_count: 1,
+        created_at: now,
+      })
+      .execute();
+  }
 
   // Store outbound message
   const dbId = crypto.randomUUID();

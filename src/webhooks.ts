@@ -28,5 +28,12 @@ export async function dispatchWebhook(
     );
   }
 
-  await fetch(url, { method: "POST", headers, body });
+  try {
+    const res = await fetch(url, { method: "POST", headers, body });
+    if (!res.ok) {
+      console.error(`Webhook ${event} failed: ${res.status} ${res.statusText}`);
+    }
+  } catch (err) {
+    console.error(`Webhook ${event} error:`, err);
+  }
 }
