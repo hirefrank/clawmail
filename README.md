@@ -163,6 +163,12 @@ Inbound emails are **unapproved by default** to prevent prompt injection. An att
 
 ## Setup
 
+### One-Click Deploy
+
+Click the **Deploy to Cloudflare** button at the top of this README. It auto-provisions D1, R2, Durable Objects, and the Email Service binding — you just need to set secrets after.
+
+### Manual Setup
+
 ```bash
 # Clone and install
 git clone https://github.com/hirefrank/clawpost.git && cd clawpost
@@ -172,8 +178,8 @@ bun install
 wrangler d1 create clawpost-db           # note the database_id in the output
 wrangler r2 bucket create clawpost-attachments
 
-# Configure — copy examples, then fill in real values
-cp wrangler.toml.example wrangler.toml   # paste database_id, set FROM_EMAIL, FROM_NAME
+# Configure
+# Edit wrangler.toml — paste database_id, set FROM_EMAIL, FROM_NAME
 cp .dev.vars.example .dev.vars           # set API_KEY (+ RESEND_API_KEY if using Resend)
 
 # Apply D1 migrations
