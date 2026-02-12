@@ -1,7 +1,7 @@
-import { Resend } from "resend";
 import { sql, type Kysely } from "kysely";
 import type { Database } from "./db/schema";
-import type { Env } from "./types";
+import { Resend } from "resend";
+import type { Env, EmailServiceAttachment } from "./types";
 
 interface AttachmentInput {
   /** Base64-encoded content for inline attachments */
@@ -25,14 +25,141 @@ interface SendEmailParams {
   attachments?: AttachmentInput[];
 }
 
+/** Resolved attachment ready to send */
+interface ResolvedAttachment {
+  content: string; // base64
+  filename: string;
+}
+
+/** Result from the underlying email provider */
+interface ProviderSendResult {
+  messageId: string;
+}
+
+/** Params for the provider-level send call */
+interface ProviderSendParams {
+  from: string;
+  to: string[];
+  subject: string;
+  text: string;
+  cc?: string[];
+  bcc?: string[];
+  replyTo?: string;
+  headers?: Record<string, string>;
+  attachments?: ResolvedAttachment[];
+}
+
+// ---------------------------------------------------------------------------
+// Provider dispatch
+// ---------------------------------------------------------------------------
+
+function getProvider(env: Env): "cloudflare" | "resend" {
+  if (env.EMAIL_PROVIDER === "cloudflare" || env.EMAIL_PROVIDER === "resend") {
+    return env.EMAIL_PROVIDER;
+  }
+  // Auto-detect: prefer Cloudflare binding if present
+  if (env.EMAIL) return "cloudflare";
+  if (env.RESEND_API_KEY) return "resend";
+  throw new Error(
+    "No email provider configured. Set EMAIL_PROVIDER or provide an EMAIL binding / RESEND_API_KEY."
+  );
+}
+
+/** Resolve from address and replyTo for the active provider */
+function getSenderConfig(env: Env) {
+  const provider = getProvider(env);
+  const fromEmail =
+    provider === "resend" && env.RESEND_FROM_EMAIL
+      ? env.RESEND_FROM_EMAIL
+      : env.FROM_EMAIL;
+  const fromName =
+    provider === "resend" && env.RESEND_FROM_NAME
+      ? env.RESEND_FROM_NAME
+      : env.FROM_NAME;
+  const replyTo =
+    provider === "resend" && env.RESEND_REPLY_TO_EMAIL
+      ? env.RESEND_REPLY_TO_EMAIL
+      : env.REPLY_TO_EMAIL;
+  return { fromEmail, fromName, replyTo, from: `${fromName} <${fromEmail}>` };
+}
+
+async function providerSend(
+  env: Env,
+  params: ProviderSendParams
+): Promise<ProviderSendResult> {
+  const provider = getProvider(env);
+
+  if (provider === "cloudflare") {
+    if (!env.EMAIL) {
+      throw new Error("EMAIL binding is required when EMAIL_PROVIDER is 'cloudflare'");
+    }
+
+    const cfAttachments: EmailServiceAttachment[] | undefined =
+      params.attachments && params.attachments.length > 0
+        ? params.attachments.map((att) => ({
+            disposition: "attachment" as const,
+            filename: att.filename,
+            type: "application/octet-stream",
+            content: att.content, // base64 string — CF Email Service accepts this directly
+          }))
+        : undefined;
+
+    const result = await env.EMAIL.send({
+      from: params.from,
+      to: params.to,
+      subject: params.subject,
+      text: params.text,
+      cc: params.cc,
+      bcc: params.bcc,
+      replyTo: params.replyTo,
+      headers: params.headers,
+      attachments: cfAttachments,
+    });
+
+    return { messageId: result.messageId };
+  }
+
+  // Resend
+  if (!env.RESEND_API_KEY) {
+    throw new Error("RESEND_API_KEY is required when EMAIL_PROVIDER is 'resend'");
+  }
+
+  const resend = new Resend(env.RESEND_API_KEY);
+
+  const { data, error } = await resend.emails.send({
+    from: params.from,
+    to: params.to,
+    cc: params.cc,
+    bcc: params.bcc,
+    subject: params.subject,
+    text: params.text,
+    replyTo: params.replyTo,
+    headers: params.headers,
+    attachments:
+      params.attachments && params.attachments.length > 0
+        ? params.attachments.map((att) => ({
+            content: att.content,
+            filename: att.filename,
+          }))
+        : undefined,
+  });
+
+  if (error) throw new Error(error.message);
+  return { messageId: data?.id ?? "" };
+}
+
+// ---------------------------------------------------------------------------
+// Attachment resolution (shared)
+// ---------------------------------------------------------------------------
+
 async function resolveAttachments(
   env: Env,
   db: Kysely<Database>,
   attachments?: AttachmentInput[]
-): Promise<{ content: string; filename: string }[]> {
+): Promise<ResolvedAttachment[]> {
   if (!attachments?.length) return [];
 
-  const resolved: { content: string; filename: string }[] = [];
+  const resolved: ResolvedAttachment[] = [];
 
   for (const att of attachments) {
     if (att.attachment_id) {
@@ -64,22 +191,26 @@ async function resolveAttachments(
   return resolved;
 }
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 export async function sendEmail(
   env: Env,
   db: Kysely<Database>,
   params: SendEmailParams
 ): Promise<{ messageId: string; dbId: string; threadId: string }> {
-  const resend = new Resend(env.RESEND_API_KEY);
   const now = Date.now();
 
-  const resendAttachments = await resolveAttachments(env, db, params.attachments);
+  const resolved = await resolveAttachments(env, db, params.attachments);
+  const sender = getSenderConfig(env);
 
   const headers: Record<string, string> = {};
   if (params.inReplyTo) headers["In-Reply-To"] = params.inReplyTo;
   if (params.references) headers["References"] = params.references;
 
-  const { data, error } = await resend.emails.send({
-    from: `${env.FROM_NAME} <${env.FROM_EMAIL}>`,
+  const result = await providerSend(env, {
+    from: sender.from,
     to: Array.isArray(params.to) ? params.to : [params.to],
     cc: params.cc
       ? Array.isArray(params.cc)
@@ -93,12 +224,10 @@ export async function sendEmail(
       : undefined,
     subject: params.subject,
     text: params.body,
-    replyTo: params.replyTo ?? env.REPLY_TO_EMAIL,
+    replyTo: params.replyTo ?? sender.replyTo,
     headers: Object.keys(headers).length > 0 ? headers : undefined,
-    attachments: resendAttachments.length > 0 ? resendAttachments : undefined,
+    attachments: resolved.length > 0 ? resolved : undefined,
   });
-
-  if (error) throw new Error(error.message);
 
   // Create or join thread
   const threadId = params.threadId ?? crypto.randomUUID();
@@ -143,9 +272,9 @@ export async function sendEmail(
     .values({
       id: dbId,
       thread_id: threadId,
-      message_id: data?.id ?? null,
+      message_id: result.messageId || null,
       in_reply_to: params.inReplyTo ?? null,
-      from: env.FROM_EMAIL,
+      from: sender.fromEmail,
       to: toStr,
       cc: ccStr,
       bcc: bccStr,
@@ -164,8 +293,8 @@ export async function sendEmail(
     .execute();
 
   // Store outbound attachments in R2
-  if (resendAttachments.length > 0) {
-    for (const att of resendAttachments) {
+  if (resolved.length > 0) {
+    for (const att of resolved) {
       const attId = crypto.randomUUID();
       const r2Key = `${dbId}/${attId}/${att.filename}`;
       const buf = Uint8Array.from(atob(att.content), (c) => c.charCodeAt(0));
@@ -186,7 +315,7 @@ export async function sendEmail(
     }
   }
 
-  return { messageId: data?.id ?? "", dbId, threadId };
+  return { messageId: result.messageId, dbId, threadId };
 }
 
 export async function replyToMessage(
@@ -204,7 +333,6 @@ export async function replyToMessage(
 
   if (!original) throw new Error(`Message ${messageId} not found`);
 
-  const resend = new Resend(env.RESEND_API_KEY);
   const now = Date.now();
 
   // Build threading headers
@@ -219,7 +347,8 @@ export async function replyToMessage(
   if (inReplyTo) replyHeaders["In-Reply-To"] = inReplyTo;
   if (references) replyHeaders["References"] = references;
 
-  const resendAttachments = await resolveAttachments(env, db, attachments);
+  const resolved = await resolveAttachments(env, db, attachments);
+  const sender = getSenderConfig(env);
 
   const replyTo =
     original.direction === "inbound" ? original.from : original.to;
@@ -227,18 +356,16 @@ export async function replyToMessage(
     ? original.subject
     : `Re: ${original.subject}`;
 
-  const { data, error } = await resend.emails.send({
-    from: `${env.FROM_NAME} <${env.FROM_EMAIL}>`,
+  const result = await providerSend(env, {
+    from: sender.from,
     to: [replyTo],
-    replyTo: env.REPLY_TO_EMAIL,
     subject,
     text: body,
+    replyTo: sender.replyTo,
     headers:
       Object.keys(replyHeaders).length > 0 ? replyHeaders : undefined,
-    attachments: resendAttachments.length > 0 ? resendAttachments : undefined,
+    attachments: resolved.length > 0 ? resolved : undefined,
   });
-
-  if (error) throw new Error(error.message);
 
   // Update thread
   await db
@@ -257,9 +384,9 @@ export async function replyToMessage(
     .values({
       id: dbId,
       thread_id: original.thread_id,
-      message_id: data?.id ?? null,
+      message_id: result.messageId || null,
       in_reply_to: inReplyTo ?? null,
-      from: env.FROM_EMAIL,
+      from: sender.fromEmail,
       to: replyTo,
       cc: null,
       bcc: null,
@@ -279,8 +406,8 @@ export async function replyToMessage(
     .execute();
 
   // Store outbound attachments in R2
-  if (resendAttachments.length > 0) {
-    for (const att of resendAttachments) {
+  if (resolved.length > 0) {
+    for (const att of resolved) {
       const attId = crypto.randomUUID();
       const r2Key = `${dbId}/${attId}/${att.filename}`;
       const buf = Uint8Array.from(atob(att.content), (c) => c.charCodeAt(0));
@@ -301,5 +428,5 @@ export async function replyToMessage(
     }
   }
 
-  return { messageId: data?.id ?? "", dbId };
+  return { messageId: result.messageId, dbId };
 }

@@ -31,7 +31,7 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
     this.server.registerTool(
       "send_email",
       {
-        description: "Send an email via Resend",
+        description: "Send an email",
         inputSchema: {
           to: z.string().describe("Recipient email address (comma-separated for multiple)"),
           subject: z.string().describe("Email subject"),

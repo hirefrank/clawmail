@@ -95,13 +95,13 @@ Use the Streamable HTTP transport with your worker URL and Bearer token auth. Ex
 
 ```
 Inbound:  email → CF Email Routing → Worker → postal-mime → D1 + R2 → webhook
-Outbound: MCP tool / API → Resend → D1 + R2
+Outbound: MCP tool / API → CF Email Service or Resend → D1 + R2
 Query:    MCP tool / API → D1 (FTS5) → results
 Status:   Resend webhook → /webhooks/resend → D1 status update
 ```
 
 - **Cloudflare Email Routing** receives inbound email — no webhooks, no open ports
-- **Resend** sends outbound email (swappable when CF transactional email launches)
+- **Cloudflare Email Service** or **Resend** sends outbound email (configurable via `EMAIL_PROVIDER` or auto-detected). Per-provider sender addresses supported via `RESEND_FROM_EMAIL` / `RESEND_FROM_NAME` / `RESEND_REPLY_TO_EMAIL` overrides
 - **D1** stores messages, threads, drafts, labels, and attachment metadata
 - **R2** stores attachment blobs (D1 has a 1 MiB row limit)
 - **FTS5** virtual table provides full-text search with automatic sync via triggers
@@ -172,14 +172,14 @@ wrangler r2 bucket create clawmail-attachments
 
 # Configure — copy examples, then fill in real values
 cp wrangler.toml.example wrangler.toml   # paste database_id, set FROM_EMAIL, FROM_NAME
-cp .dev.vars.example .dev.vars           # set API_KEY, RESEND_API_KEY
+cp .dev.vars.example .dev.vars           # set API_KEY (+ RESEND_API_KEY if using Resend)
 
 # Apply D1 migrations
 bun run db:migrate
 
 # Set production secrets
 wrangler secret put API_KEY
-wrangler secret put RESEND_API_KEY
+# wrangler secret put RESEND_API_KEY  # only if using Resend
 
 # Optional: webhook secrets
 wrangler secret put WEBHOOK_SECRET          # HMAC key for outbound webhooks

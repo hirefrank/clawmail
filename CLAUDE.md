@@ -21,7 +21,9 @@ Cloudflare Worker with two entry points: `fetch` (HTTP) and `email` (inbound ema
 
 **Data flow:**
 - Inbound email (`src/email.ts`): `postal-mime` parses raw email → checks `approved_senders` table → stores in D1 with `approved=1` if sender is known, `approved=0` otherwise → attachments to R2 → dispatches `message.received` webhook if `WEBHOOK_URL` is set
-- Outbound email (`src/mail.ts`): Resend SDK sends → stores sent message in D1 with `approved=1` (always) and `status='sent'`, attachments in R2
+- Outbound email (`src/mail.ts`): sends via Cloudflare Email Service (default) or Resend → stores sent message in D1 with `approved=1` (always) and `status='sent'`, attachments in R2
+- Email provider selection: set `EMAIL_PROVIDER` var to `"cloudflare"` or `"resend"`, or omit to auto-detect from bindings (prefers Cloudflare `EMAIL` binding, falls back to `RESEND_API_KEY`)
+- Per-provider sender config: `FROM_EMAIL`/`FROM_NAME`/`REPLY_TO_EMAIL` are defaults; set `RESEND_FROM_EMAIL`/`RESEND_FROM_NAME`/`RESEND_REPLY_TO_EMAIL` to override when Resend uses a different sending domain
 - Delivery tracking: Resend sends status webhooks to `POST /webhooks/resend` → updates `messages.status` in D1
 - Both API routes and MCP tools call shared service functions: `src/mail.ts` (send/reply), `src/labels.ts` (add/remove), `src/archive.ts` (archive/unarchive), `src/search.ts` (FTS5 search), `src/drafts.ts` (draft CRUD + send)
 

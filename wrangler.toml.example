@@ -30,11 +30,27 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["EmailMCP"]
 
+# --- Email Sending ---
+# Option A: Cloudflare Email Service (recommended)
+# Requires domain onboarded at Compute & AI > Email Service > Email Sending
+[[send_email]]
+name = "EMAIL"
+
+# Option B: Resend
+# Set RESEND_API_KEY as a secret (see below)
+
 # --- Environment Variables ---
 [vars]
 FROM_EMAIL = "noreply@yourdomain.com"
 FROM_NAME = "Clawmail"
 REPLY_TO_EMAIL = "reply@yourdomain.com"
+# EMAIL_PROVIDER = "cloudflare"  # or "resend" — auto-detected if omitted
+
+# Resend-specific sender overrides (optional — falls back to FROM_EMAIL / FROM_NAME / REPLY_TO_EMAIL)
+# Use when Resend requires a different sending domain (e.g. notifications.yourdomain.com)
+# RESEND_FROM_EMAIL = "noreply@notifications.yourdomain.com"
+# RESEND_FROM_NAME = "Clawmail"
+# RESEND_REPLY_TO_EMAIL = "reply@yourdomain.com"
 
 # Optional: Webhook URL to POST on inbound email (message.received event)
 # WEBHOOK_URL = "https://your-app.com/webhook"
@@ -42,7 +58,7 @@ REPLY_TO_EMAIL = "reply@yourdomain.com"
 # --- Secrets ---
 # Set these with:
 #   wrangler secret put API_KEY
-#   wrangler secret put RESEND_API_KEY
+#   wrangler secret put RESEND_API_KEY          (only needed for Resend provider)
 #   wrangler secret put WEBHOOK_SECRET          (optional: HMAC signing key for outbound webhooks)
 #   wrangler secret put RESEND_WEBHOOK_SECRET   (optional: token for Resend delivery status webhooks)
 
