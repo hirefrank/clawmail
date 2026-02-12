@@ -16,6 +16,7 @@ interface SendEmailParams {
   subject: string;
   body: string;
   cc?: string | string[];
+  bcc?: string | string[];
   replyTo?: string;
   inReplyTo?: string;
   references?: string;
@@ -83,6 +84,11 @@ export async function sendEmail(
         ? params.cc
         : [params.cc]
       : undefined,
+    bcc: params.bcc
+      ? Array.isArray(params.bcc)
+        ? params.bcc
+        : [params.bcc]
+      : undefined,
     subject: params.subject,
     text: params.body,
     replyTo: params.replyTo ?? env.REPLY_TO_EMAIL,
@@ -113,6 +119,11 @@ export async function sendEmail(
       ? params.cc.join(", ")
       : params.cc
     : null;
+  const bccStr = params.bcc
+    ? Array.isArray(params.bcc)
+      ? params.bcc.join(", ")
+      : params.bcc
+    : null;
 
   await db
     .insertInto("messages")
@@ -124,6 +135,7 @@ export async function sendEmail(
       from: env.FROM_EMAIL,
       to: toStr,
       cc: ccStr,
+      bcc: bccStr,
       subject: params.subject,
       body_text: params.body,
       body_html: null,
@@ -132,6 +144,8 @@ export async function sendEmail(
         : null,
       direction: "outbound",
       approved: 1,
+      status: "sent",
+      archived: 0,
       created_at: now,
     })
     .execute();
@@ -235,6 +249,7 @@ export async function replyToMessage(
       from: env.FROM_EMAIL,
       to: replyTo,
       cc: null,
+      bcc: null,
       subject,
       body_text: body,
       body_html: null,
@@ -244,6 +259,8 @@ export async function replyToMessage(
           : null,
       direction: "outbound",
       approved: 1,
+      status: "sent",
+      archived: 0,
       created_at: now,
     })
     .execute();

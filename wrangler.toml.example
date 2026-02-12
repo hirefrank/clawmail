@@ -36,10 +36,22 @@ FROM_EMAIL = "noreply@yourdomain.com"
 FROM_NAME = "Clawmail"
 REPLY_TO_EMAIL = "reply@yourdomain.com"
 
+# Optional: Webhook URL to POST on inbound email (message.received event)
+# WEBHOOK_URL = "https://your-app.com/webhook"
+
 # --- Secrets ---
 # Set these with:
 #   wrangler secret put API_KEY
 #   wrangler secret put RESEND_API_KEY
+#   wrangler secret put WEBHOOK_SECRET          (optional: HMAC signing key for outbound webhooks)
+#   wrangler secret put RESEND_WEBHOOK_SECRET   (optional: token for Resend delivery status webhooks)
+
+# --- Resend Delivery Webhooks ---
+# To track delivery status (sent/delivered/bounced/complained):
+#   1. Set RESEND_WEBHOOK_SECRET via `wrangler secret put RESEND_WEBHOOK_SECRET`
+#   2. In Resend dashboard → Webhooks → Add endpoint:
+#      URL: https://your-worker.dev/webhooks/resend?token=YOUR_SECRET
+#      Events: email.sent, email.delivered, email.bounced, email.complained
 
 # --- Email Routing ---
 # Configure in Cloudflare dashboard:

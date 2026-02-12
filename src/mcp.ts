@@ -1,6 +1,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { sql } from "kysely";
 import { getDb } from "./db/client";
 import { sendEmail, replyToMessage } from "./mail";
 import type { Env } from "./types";
@@ -8,7 +9,7 @@ import type { Env } from "./types";
 export class EmailMCP extends McpAgent<Env, {}, {}> {
   server = new McpServer({
     name: "clawmail",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   async init() {
@@ -22,6 +23,7 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
           subject: z.string().describe("Email subject"),
           body: z.string().describe("Email body (plain text)"),
           cc: z.union([z.string(), z.array(z.string())]).optional().describe("CC recipients"),
+          bcc: z.union([z.string(), z.array(z.string())]).optional().describe("BCC recipients"),
           attachments: z.array(z.object({
             content: z.string().optional().describe("Base64-encoded content"),
             filename: z.string().describe("Filename"),
@@ -29,9 +31,9 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
           })).optional().describe("Attachments to include"),
         },
       },
-      async ({ to, subject, body, cc, attachments }) => {
+      async ({ to, subject, body, cc, bcc, attachments }) => {
         const db = getDb(this.env.DB);
-        const result = await sendEmail(this.env, db, { to, subject, body, cc, attachments });
+        const result = await sendEmail(this.env, db, { to, subject, body, cc, bcc, attachments });
         return {
           content: [
             {
@@ -43,7 +45,7 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       }
     );
 
-    // list_messages (approved only)
+    // list_messages (approved only, excludes archived by default)
     this.server.registerTool(
       "list_messages",
       {
@@ -53,9 +55,11 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
           offset: z.number().optional().default(0).describe("Offset for pagination"),
           direction: z.enum(["inbound", "outbound"]).optional().describe("Filter by direction"),
           from: z.string().optional().describe("Filter by sender address"),
+          label: z.string().optional().describe("Filter by label"),
+          include_archived: z.boolean().optional().default(false).describe("Include archived messages"),
         },
       },
-      async ({ limit, offset, direction, from }) => {
+      async ({ limit, offset, direction, from, label, include_archived }) => {
         const db = getDb(this.env.DB);
         let query = db
           .selectFrom("messages")
@@ -65,8 +69,16 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
           .limit(limit ?? 50)
           .offset(offset ?? 0);
 
+        if (!include_archived) query = query.where("archived", "=", 0);
         if (direction) query = query.where("direction", "=", direction);
         if (from) query = query.where("from", "=", from);
+        if (label) {
+          query = query.where("id", "in",
+            db.selectFrom("message_labels")
+              .select("message_id")
+              .where("label", "=", label)
+          );
+        }
 
         const messages = await query.execute();
         return {
@@ -84,7 +96,7 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
     this.server.registerTool(
       "read_message",
       {
-        description: "Read a single approved email message with attachment metadata",
+        description: "Read a single approved email message with attachment metadata and labels",
         inputSchema: {
           id: z.string().describe("Message ID"),
         },
@@ -111,11 +123,21 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
           .where("message_id", "=", id)
           .execute();
 
+        const labels = await db
+          .selectFrom("message_labels")
+          .select("label")
+          .where("message_id", "=", id)
+          .execute();
+
         return {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ ...message, attachments }, null, 2),
+              text: JSON.stringify({
+                ...message,
+                attachments,
+                labels: labels.map((l) => l.label),
+              }, null, 2),
             },
           ],
         };
@@ -232,31 +254,52 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
       }
     );
 
-    // search_messages (approved only)
+    // search_messages (FTS5 with LIKE fallback, approved only)
     this.server.registerTool(
       "search_messages",
       {
-        description: "Search approved messages by subject or body text",
+        description: "Search approved messages by subject or body text (full-text search)",
         inputSchema: {
           query: z.string().describe("Search query"),
           limit: z.number().optional().default(20).describe("Max results"),
+          include_archived: z.boolean().optional().default(false).describe("Include archived messages"),
         },
       },
-      async ({ query, limit }) => {
+      async ({ query, limit, include_archived }) => {
         const db = getDb(this.env.DB);
-        const messages = await db
-          .selectFrom("messages")
-          .selectAll()
-          .where("approved", "=", 1)
-          .where((eb) =>
-            eb.or([
-              eb("subject", "like", `%${query}%`),
-              eb("body_text", "like", `%${query}%`),
-            ])
-          )
-          .orderBy("created_at", "desc")
-          .limit(limit ?? 20)
-          .execute();
+        const maxResults = limit ?? 20;
+
+        let messages;
+        try {
+          const archivedFilter = include_archived ? sql`1=1` : sql`m.archived = 0`;
+          const results = await sql`
+            SELECT m.* FROM messages m
+            JOIN messages_fts f ON f.message_id = m.id
+            WHERE messages_fts MATCH ${query}
+            AND m.approved = 1
+            AND ${archivedFilter}
+            ORDER BY rank
+            LIMIT ${maxResults}
+          `.execute(db);
+          messages = results.rows;
+        } catch {
+          // Fallback to LIKE search
+          let q = db
+            .selectFrom("messages")
+            .selectAll()
+            .where("approved", "=", 1)
+            .where((eb) =>
+              eb.or([
+                eb("subject", "like", `%${query}%`),
+                eb("body_text", "like", `%${query}%`),
+              ])
+            )
+            .orderBy("created_at", "desc")
+            .limit(maxResults);
+
+          if (!include_archived) q = q.where("archived", "=", 0);
+          messages = await q.execute();
+        }
 
         return {
           content: [
@@ -299,6 +342,350 @@ export class EmailMCP extends McpAgent<Env, {}, {}> {
             {
               type: "text" as const,
               text: JSON.stringify(threads, null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    // --- Labels ---
+
+    this.server.registerTool(
+      "add_labels",
+      {
+        description: "Add one or more labels to an approved message",
+        inputSchema: {
+          id: z.string().describe("Message ID"),
+          labels: z.array(z.string()).describe("Labels to add"),
+        },
+      },
+      async ({ id, labels }) => {
+        const db = getDb(this.env.DB);
+
+        const msg = await db
+          .selectFrom("messages")
+          .select("approved")
+          .where("id", "=", id)
+          .executeTakeFirst();
+
+        if (!msg || msg.approved !== 1) {
+          return {
+            content: [{ type: "text" as const, text: "Message not found" }],
+            isError: true,
+          };
+        }
+
+        const now = Date.now();
+        for (const label of labels) {
+          await db
+            .insertInto("message_labels")
+            .values({ message_id: id, label, created_at: now })
+            .onConflict((oc) => oc.columns(["message_id", "label"]).doNothing())
+            .execute();
+        }
+
+        const allLabels = await db
+          .selectFrom("message_labels")
+          .select("label")
+          .where("message_id", "=", id)
+          .execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Labels updated. Current labels: ${allLabels.map((l) => l.label).join(", ")}`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.registerTool(
+      "remove_label",
+      {
+        description: "Remove a label from a message",
+        inputSchema: {
+          id: z.string().describe("Message ID"),
+          label: z.string().describe("Label to remove"),
+        },
+      },
+      async ({ id, label }) => {
+        const db = getDb(this.env.DB);
+
+        await db
+          .deleteFrom("message_labels")
+          .where("message_id", "=", id)
+          .where("label", "=", label)
+          .execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Removed label: ${label}`,
+            },
+          ],
+        };
+      }
+    );
+
+    // --- Archive / Unarchive ---
+
+    this.server.registerTool(
+      "archive_message",
+      {
+        description: "Archive a message (hides from default queries)",
+        inputSchema: {
+          id: z.string().describe("Message ID to archive"),
+        },
+      },
+      async ({ id }) => {
+        const db = getDb(this.env.DB);
+
+        await db
+          .updateTable("messages")
+          .set({ archived: 1 })
+          .where("id", "=", id)
+          .execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Message ${id} archived`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.registerTool(
+      "unarchive_message",
+      {
+        description: "Unarchive a previously archived message",
+        inputSchema: {
+          id: z.string().describe("Message ID to unarchive"),
+        },
+      },
+      async ({ id }) => {
+        const db = getDb(this.env.DB);
+
+        await db
+          .updateTable("messages")
+          .set({ archived: 0 })
+          .where("id", "=", id)
+          .execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Message ${id} unarchived`,
+            },
+          ],
+        };
+      }
+    );
+
+    // --- Drafts ---
+
+    this.server.registerTool(
+      "create_draft",
+      {
+        description: "Create an email draft for later review and sending",
+        inputSchema: {
+          to: z.string().optional().describe("Recipient email address"),
+          cc: z.string().optional().describe("CC recipients"),
+          bcc: z.string().optional().describe("BCC recipients"),
+          subject: z.string().optional().describe("Email subject"),
+          body_text: z.string().optional().describe("Email body (plain text)"),
+          thread_id: z.string().optional().describe("Thread ID to associate with"),
+        },
+      },
+      async ({ to, cc, bcc, subject, body_text, thread_id }) => {
+        const db = getDb(this.env.DB);
+        const now = Date.now();
+        const id = crypto.randomUUID();
+
+        await db
+          .insertInto("drafts")
+          .values({
+            id,
+            thread_id: thread_id ?? null,
+            to: to ?? null,
+            cc: cc ?? null,
+            bcc: bcc ?? null,
+            subject: subject ?? "",
+            body_text: body_text ?? "",
+            created_at: now,
+            updated_at: now,
+          })
+          .execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Draft created.\nID: ${id}`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.registerTool(
+      "update_draft",
+      {
+        description: "Update an existing email draft",
+        inputSchema: {
+          id: z.string().describe("Draft ID"),
+          to: z.string().optional().describe("Recipient email address"),
+          cc: z.string().optional().describe("CC recipients"),
+          bcc: z.string().optional().describe("BCC recipients"),
+          subject: z.string().optional().describe("Email subject"),
+          body_text: z.string().optional().describe("Email body (plain text)"),
+        },
+      },
+      async ({ id, to, cc, bcc, subject, body_text }) => {
+        const db = getDb(this.env.DB);
+
+        const existing = await db
+          .selectFrom("drafts")
+          .select("id")
+          .where("id", "=", id)
+          .executeTakeFirst();
+
+        if (!existing) {
+          return {
+            content: [{ type: "text" as const, text: "Draft not found" }],
+            isError: true,
+          };
+        }
+
+        const updates: Record<string, unknown> = { updated_at: Date.now() };
+        if (to !== undefined) updates.to = to;
+        if (cc !== undefined) updates.cc = cc;
+        if (bcc !== undefined) updates.bcc = bcc;
+        if (subject !== undefined) updates.subject = subject;
+        if (body_text !== undefined) updates.body_text = body_text;
+
+        await db
+          .updateTable("drafts")
+          .set(updates)
+          .where("id", "=", id)
+          .execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Draft ${id} updated`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.registerTool(
+      "list_drafts",
+      {
+        description: "List all email drafts",
+        inputSchema: {
+          limit: z.number().optional().default(50).describe("Max drafts to return"),
+          offset: z.number().optional().default(0).describe("Offset for pagination"),
+        },
+      },
+      async ({ limit, offset }) => {
+        const db = getDb(this.env.DB);
+        const drafts = await db
+          .selectFrom("drafts")
+          .selectAll()
+          .orderBy("updated_at", "desc")
+          .limit(limit ?? 50)
+          .offset(offset ?? 0)
+          .execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(drafts, null, 2),
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.registerTool(
+      "send_draft",
+      {
+        description: "Send an existing draft as an email (draft is deleted after sending)",
+        inputSchema: {
+          id: z.string().describe("Draft ID to send"),
+        },
+      },
+      async ({ id }) => {
+        const db = getDb(this.env.DB);
+
+        const draft = await db
+          .selectFrom("drafts")
+          .selectAll()
+          .where("id", "=", id)
+          .executeTakeFirst();
+
+        if (!draft) {
+          return {
+            content: [{ type: "text" as const, text: "Draft not found" }],
+            isError: true,
+          };
+        }
+
+        if (!draft.to) {
+          return {
+            content: [{ type: "text" as const, text: "Draft has no recipient" }],
+            isError: true,
+          };
+        }
+
+        const result = await sendEmail(this.env, db, {
+          to: draft.to,
+          subject: draft.subject,
+          body: draft.body_text,
+          cc: draft.cc ?? undefined,
+          bcc: draft.bcc ?? undefined,
+        });
+
+        await db.deleteFrom("drafts").where("id", "=", id).execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Draft sent successfully.\nResend ID: ${result.messageId}\nDB ID: ${result.dbId}\nThread ID: ${result.threadId}`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.registerTool(
+      "delete_draft",
+      {
+        description: "Delete an email draft without sending",
+        inputSchema: {
+          id: z.string().describe("Draft ID to delete"),
+        },
+      },
+      async ({ id }) => {
+        const db = getDb(this.env.DB);
+        await db.deleteFrom("drafts").where("id", "=", id).execute();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Draft ${id} deleted`,
             },
           ],
         };

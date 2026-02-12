@@ -7,4 +7,7 @@ export interface Env {
   FROM_EMAIL: string;
   FROM_NAME: string;
   REPLY_TO_EMAIL: string;
+  WEBHOOK_URL?: string;
+  WEBHOOK_SECRET?: string;
+  RESEND_WEBHOOK_SECRET?: string;
 }
