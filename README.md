@@ -4,6 +4,8 @@ Email for AI agents. A self-hosted Cloudflare Worker that gives your agent its o
 
 Built for [openclaw.ai](https://openclaw.ai).
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/hirefrank/clawpost)
+
 ## MCP Server
 
 Connect any MCP client to `https://<your-worker>/mcp` with `Authorization: Bearer <API_KEY>`.
