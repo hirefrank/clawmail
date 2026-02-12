@@ -1,6 +1,10 @@
 import { sql, type Kysely } from "kysely";
 import type { Database, Message } from "./db/schema";
 
+function escapeLike(s: string): string {
+  return s.replace(/[%_\\]/g, "\\$&");
+}
+
 export async function searchMessages(
   db: Kysely<Database>,
   query: string,
@@ -21,14 +25,15 @@ export async function searchMessages(
     return results.rows as Message[];
   } catch {
     // Fallback to LIKE search if FTS query syntax is invalid
+    const escaped = escapeLike(query);
     let q = db
       .selectFrom("messages")
       .selectAll()
       .where("approved", "=", 1)
       .where((eb) =>
         eb.or([
-          eb("subject", "like", `%${query}%`),
-          eb("body_text", "like", `%${query}%`),
+          eb("subject", "like", `%${escaped}%`),
+          eb("body_text", "like", `%${escaped}%`),
         ])
       )
       .orderBy("created_at", "desc")

@@ -15,13 +15,11 @@ export async function addLabels(
   if (!msg || msg.approved !== 1) return null;
 
   const now = Date.now();
-  for (const label of labels) {
-    await db
-      .insertInto("message_labels")
-      .values({ message_id: messageId, label, created_at: now })
-      .onConflict((oc) => oc.columns(["message_id", "label"]).doNothing())
-      .execute();
-  }
+  await db
+    .insertInto("message_labels")
+    .values(labels.map((label) => ({ message_id: messageId, label, created_at: now })))
+    .onConflict((oc) => oc.columns(["message_id", "label"]).doNothing())
+    .execute();
 
   const allLabels = await db
     .selectFrom("message_labels")
